@@ -347,6 +347,116 @@ async def logout(request: Request, response: Response):
     response.delete_cookie("session_token", path="/")
     return {"message": "Logged out successfully"}
 
+# ==================== SIMPLE LOGIN/REGISTER ====================
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+@api_router.post("/auth/register")
+async def register(data: RegisterRequest, response: Response):
+    """Simple email/password registration"""
+    # Check if user exists
+    existing = await db.users.find_one({"email": data.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+    
+    # Hash password
+    hashed_password = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt())
+    
+    # Create user
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    new_user = {
+        "user_id": user_id,
+        "email": data.email,
+        "name": data.name,
+        "password": hashed_password.decode(),
+        "role": "customer",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.users.insert_one(new_user)
+    
+    # Create cart
+    cart = {
+        "cart_id": f"cart_{uuid.uuid4().hex[:12]}", 
+        "user_id": user_id, 
+        "items": [], 
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.carts.insert_one(cart)
+    
+    # Create session
+    session_token = f"session_{uuid.uuid4().hex[:20]}"
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    session_doc = {
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.user_sessions.insert_one(session_doc)
+    
+    # Set cookie
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=7 * 24 * 60 * 60
+    )
+    
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    del user["password"]  # Don't return password
+    return user
+
+@api_router.post("/auth/login")
+async def login(data: LoginRequest, response: Response):
+    """Simple email/password login"""
+    user = await db.users.find_one({"email": data.email})
+    
+    if not user or "password" not in user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    # Check password
+    if not bcrypt.checkpw(data.password.encode(), user["password"].encode()):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    user_id = user["user_id"]
+    
+    # Create session
+    session_token = f"session_{uuid.uuid4().hex[:20]}"
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    session_doc = {
+        "user_id": user_id,
+        "session_token": session_token,
+        "expires_at": expires_at.isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.user_sessions.insert_one(session_doc)
+    
+    # Set cookie
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+        max_age=7 * 24 * 60 * 60
+    )
+    
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
+    if "password" in user:
+        del user["password"]
+    return user
+
 @api_router.post("/auth/google")
 async def google_login(request: Request, response: Response):
     """Handle Google OAuth login"""
