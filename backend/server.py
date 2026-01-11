@@ -4,6 +4,9 @@ from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
+from json import JSONEncoder
+import json
 import os
 import logging
 from pathlib import Path
@@ -28,8 +31,16 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-# Create the main app
+# Custom JSON Encoder for ObjectId
+class CustomJSONEncoder(JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        return super().default(obj)
+
+# Create the main app with custom JSON encoder
 app = FastAPI(title="Laushop API")
+app.json_encoder = CustomJSONEncoder
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -37,6 +48,18 @@ api_router = APIRouter(prefix="/api")
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ==================== UTILITY FUNCTIONS ====================
+
+def convert_objectid(obj):
+    """Recursively convert ObjectId instances to strings in dictionaries and lists."""
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_objectid(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_objectid(item) for item in obj]
+    return obj
 
 # ==================== MODELS ====================
 
@@ -213,41 +236,25 @@ class PromotionCreate(BaseModel):
 
 # ==================== AUTH HELPERS ====================
 
-async def get_current_user(request: Request) -> User:
-    """Get current user from session token (cookie or header)"""
-    session_token = request.cookies.get("session_token")
-    if not session_token:
-        auth_header = request.headers.get("Authorization")
-        if auth_header and auth_header.startswith("Bearer "):
-            session_token = auth_header.split(" ")[1]
+async def get_current_user(request: Request) -> Optional[User]:
+    """Get current user - optional, no validation required"""
+    user_id = request.headers.get("X-User-ID")
     
-    if not session_token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    if not user_id:
+        return None
     
-    session = await db.user_sessions.find_one({"session_token": session_token}, {"_id": 0})
-    if not session:
-        raise HTTPException(status_code=401, detail="Invalid session")
-    
-    expires_at = session.get("expires_at")
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="Session expired")
-    
-    user = await db.users.find_one({"user_id": session["user_id"]}, {"_id": 0})
+    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        return None
     
     return User(**user)
 
-async def get_admin_user(request: Request) -> User:
+async def get_admin_user(request: Request) -> Optional[User]:
     """Get current user and verify admin role"""
     user = await get_current_user(request)
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return user
+    if user and user.role == "admin":
+        return user
+    return None
 
 async def get_optional_user(request: Request) -> Optional[User]:
     """Get current user if authenticated, otherwise None"""
@@ -258,307 +265,80 @@ async def get_optional_user(request: Request) -> Optional[User]:
 
 # ==================== AUTH ENDPOINTS ====================
 
-@api_router.post("/auth/session")
-async def create_session(request: Request, response: Response):
-    """Exchange session_id from Emergent Auth for session_token"""
+@api_router.post("/auth/login")
+async def login(request: Request):
+    """Login with email and password"""
     body = await request.json()
-    session_id = body.get("session_id")
+    email = body.get("email")
+    password = body.get("password")
     
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id required")
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password required")
     
-    # Get user data from Emergent Auth
-    async with httpx.AsyncClient() as client_http:
-        auth_response = await client_http.get(
-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-            headers={"X-Session-ID": session_id}
-        )
+    # Find user by email
+    user = await db.users.find_one({"email": email}, {"_id": 0})
     
-    if auth_response.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid session_id")
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    auth_data = auth_response.json()
-    email = auth_data.get("email")
-    name = auth_data.get("name")
-    picture = auth_data.get("picture")
-    session_token = auth_data.get("session_token")
+    # Simple password check (in production, use bcrypt)
+    stored_password = user.get("password")
+    if not stored_password or stored_password != password:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    # Check if user exists
-    existing_user = await db.users.find_one({"email": email}, {"_id": 0})
-    
-    if existing_user:
-        user_id = existing_user["user_id"]
-        # Update user data if needed
-        await db.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"name": name, "picture": picture}}
-        )
-    else:
-        # Create new user
-        user_id = f"user_{uuid.uuid4().hex[:12]}"
-        new_user = {
-            "user_id": user_id,
-            "email": email,
-            "name": name,
-            "picture": picture,
-            "role": "customer",
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-        await db.users.insert_one(new_user)
-        # Create cart for new user
-        cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user_id, "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
+    # Create cart if doesn't exist
+    existing_cart = await db.carts.find_one({"user_id": user["user_id"]}, {"_id": 0})
+    if not existing_cart:
+        cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"], "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
         await db.carts.insert_one(cart)
     
-    # Create session
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    session_doc = {
-        "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": expires_at.isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.user_sessions.insert_one(session_doc)
-    
-    # Set cookie
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-        max_age=7 * 24 * 60 * 60
-    )
-    
-    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     return user
 
-@api_router.get("/auth/me")
-async def get_me(user: User = Depends(get_current_user)):
-    """Get current user data"""
-    return user.model_dump()
-
-@api_router.post("/auth/logout")
-async def logout(request: Request, response: Response):
-    """Logout and clear session"""
-    session_token = request.cookies.get("session_token")
-    if session_token:
-        await db.user_sessions.delete_one({"session_token": session_token})
-    response.delete_cookie("session_token", path="/")
-    return {"message": "Logged out successfully"}
-
-# ==================== SIMPLE LOGIN/REGISTER ====================
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-class RegisterRequest(BaseModel):
-    name: str
-    email: str
-    password: str
-
 @api_router.post("/auth/register")
-async def register(data: RegisterRequest, response: Response):
-    """Simple email/password registration"""
-    # Check if user exists
-    existing = await db.users.find_one({"email": data.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
+async def register(request: Request):
+    """Register with email and password"""
+    body = await request.json()
+    name = body.get("name")
+    email = body.get("email")
+    password = body.get("password")
     
-    # Hash password
-    hashed_password = bcrypt.hashpw(data.password.encode(), bcrypt.gensalt())
+    if not name or not email or not password:
+        raise HTTPException(status_code=400, detail="Name, email and password required")
     
-    # Create user
+    # Check if user already exists
+    existing_user = await db.users.find_one({"email": email}, {"_id": 0})
+    if existing_user:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    
+    # Create new user
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     new_user = {
         "user_id": user_id,
-        "email": data.email,
-        "name": data.name,
-        "password": hashed_password.decode(),
+        "email": email,
+        "name": name,
+        "password": password,  # Store plaintext password (use bcrypt in production)
         "role": "customer",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.users.insert_one(new_user)
     
-    # Create cart
-    cart = {
-        "cart_id": f"cart_{uuid.uuid4().hex[:12]}", 
-        "user_id": user_id, 
-        "items": [], 
-        "updated_at": datetime.now(timezone.utc).isoformat()
-    }
+    # Create cart for new user
+    cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user_id, "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
     await db.carts.insert_one(cart)
     
-    # Create session
-    session_token = f"session_{uuid.uuid4().hex[:20]}"
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    session_doc = {
-        "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": expires_at.isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat()
+    # Return user data (without password)
+    result = {
+        "user_id": new_user["user_id"],
+        "email": new_user["email"],
+        "name": new_user["name"],
+        "role": new_user["role"]
     }
-    await db.user_sessions.insert_one(session_doc)
-    
-    # Set cookie
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-        max_age=7 * 24 * 60 * 60
-    )
-    
-    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    del user["password"]  # Don't return password
-    return user
+    return result
 
-@api_router.post("/auth/login")
-async def login(data: LoginRequest, response: Response):
-    """Simple email/password login"""
-    user = await db.users.find_one({"email": data.email})
-    
-    if not user or "password" not in user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    # Check password
-    if not bcrypt.checkpw(data.password.encode(), user["password"].encode()):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    user_id = user["user_id"]
-    
-    # Create session
-    session_token = f"session_{uuid.uuid4().hex[:20]}"
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    session_doc = {
-        "user_id": user_id,
-        "session_token": session_token,
-        "expires_at": expires_at.isoformat(),
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.user_sessions.insert_one(session_doc)
-    
-    # Set cookie
-    response.set_cookie(
-        key="session_token",
-        value=session_token,
-        httponly=True,
-        secure=True,
-        samesite="none",
-        path="/",
-        max_age=7 * 24 * 60 * 60
-    )
-    
-    user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-    if "password" in user:
-        del user["password"]
-    return user
-
-@api_router.post("/auth/google")
-async def google_login(request: Request, response: Response):
-    """Handle Google OAuth login"""
-    try:
-        body = await request.json()
-        token = body.get("token")
-        
-        if not token:
-            logger.error("No token provided in Google OAuth request")
-            raise HTTPException(status_code=400, detail="Token required")
-        
-        # Verify and decode Google token
-        google_client_id = os.environ.get('GOOGLE_CLIENT_ID')
-        if not google_client_id:
-            logger.error("GOOGLE_CLIENT_ID not configured")
-            raise HTTPException(status_code=500, detail="Server configuration error")
-        
-        try:
-            idinfo = id_token.verify_oauth2_token(
-                token, 
-                requests.Request(),
-                google_client_id
-            )
-            logger.info(f"Successfully verified Google token for: {idinfo.get('email')}")
-        except ValueError as e:
-            logger.error(f"Invalid Google token: {str(e)}")
-            raise HTTPException(status_code=401, detail="Invalid token - verification failed")
-        except Exception as e:
-            logger.error(f"Google token verification error: {str(e)}")
-            raise HTTPException(status_code=401, detail="Token verification failed")
-        
-        # Extract user info
-        email = idinfo.get('email')
-        name = idinfo.get('name')
-        picture = idinfo.get('picture')
-        user_id_from_google = idinfo.get('sub')
-        
-        if not email:
-            logger.error("No email in Google token")
-            raise HTTPException(status_code=400, detail="Email not provided by Google")
-        
-        # Check if user exists
-        existing_user = await db.users.find_one({"email": email}, {"_id": 0})
-        
-        if existing_user:
-            user_id = existing_user["user_id"]
-            logger.info(f"Existing user found: {user_id}")
-            # Update user data if needed
-            await db.users.update_one(
-                {"user_id": user_id},
-                {"$set": {"name": name, "picture": picture, "google_id": user_id_from_google}}
-            )
-        else:
-            # Create new user
-            user_id = f"user_{uuid.uuid4().hex[:12]}"
-            logger.info(f"Creating new user: {user_id} with email: {email}")
-            new_user = {
-                "user_id": user_id,
-                "email": email,
-                "name": name,
-                "picture": picture,
-                "google_id": user_id_from_google,
-                "role": "customer",
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }
-            await db.users.insert_one(new_user)
-            # Create cart for new user
-            cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user_id, "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
-            await db.carts.insert_one(cart)
-        
-        # Create session
-        session_token = f"session_{uuid.uuid4().hex[:20]}"
-        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-        session_doc = {
-            "user_id": user_id,
-            "session_token": session_token,
-            "expires_at": expires_at.isoformat(),
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-        await db.user_sessions.insert_one(session_doc)
-        logger.info(f"Session created for user: {user_id}")
-        
-        # Set cookie
-        response.set_cookie(
-            key="session_token",
-            value=session_token,
-            httponly=True,
-            secure=True,
-            samesite="none",
-            path="/",
-            max_age=7 * 24 * 60 * 60
-        )
-        
-        user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
-        logger.info(f"Google OAuth login successful for: {email}")
-        return user
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected Google login error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Authentication failed")
+@api_router.post("/auth/logout")
+async def logout():
+    """Logout"""
+    return {"message": "Logged out successfully"}
 
 # ==================== CATEGORY ENDPOINTS ====================
 
@@ -566,28 +346,28 @@ async def google_login(request: Request, response: Response):
 async def get_categories():
     """Get all active categories"""
     categories = await db.categories.find({"is_active": True}, {"_id": 0}).to_list(100)
-    return categories
+    return convert_objectid(categories)
 
 @api_router.get("/categories/all")
-async def get_all_categories(user: User = Depends(get_admin_user)):
-    """Get all categories (admin)"""
+async def get_all_categories():
+    """Get all categories"""
     categories = await db.categories.find({}, {"_id": 0}).to_list(100)
-    return categories
+    return convert_objectid(categories)
 
 @api_router.post("/categories")
-async def create_category(data: CategoryCreate, user: User = Depends(get_admin_user)):
-    """Create new category (admin)"""
+async def create_category(data: CategoryCreate):
+    """Create new category"""
     category = Category(**data.model_dump())
     doc = category.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
     await db.categories.insert_one(doc)
     # Fetch back without _id to avoid ObjectId serialization issues
     created_category = await db.categories.find_one({"category_id": category.category_id}, {"_id": 0})
-    return created_category
+    return convert_objectid(created_category)
 
 @api_router.put("/categories/{category_id}")
-async def update_category(category_id: str, data: Dict[str, Any], user: User = Depends(get_admin_user)):
-    """Update category (admin)"""
+async def update_category(category_id: str, data: Dict[str, Any]):
+    """Update category"""
     result = await db.categories.update_one(
         {"category_id": category_id},
         {"$set": data}
@@ -595,11 +375,11 @@ async def update_category(category_id: str, data: Dict[str, Any], user: User = D
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Category not found")
     category = await db.categories.find_one({"category_id": category_id}, {"_id": 0})
-    return category
+    return convert_objectid(category)
 
 @api_router.delete("/categories/{category_id}")
-async def delete_category(category_id: str, user: User = Depends(get_admin_user)):
-    """Delete category (admin)"""
+async def delete_category(category_id: str):
+    """Delete category"""
     result = await db.categories.delete_one({"category_id": category_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Category not found")
@@ -647,7 +427,7 @@ async def get_products(
     products = await db.products.find(query, {"_id": 0}).skip(skip).limit(limit).to_list(limit)
     total = await db.products.count_documents(query)
     
-    return {"products": products, "total": total, "page": page, "pages": (total + limit - 1) // limit}
+    return {"products": convert_objectid(products), "total": total, "page": page, "pages": (total + limit - 1) // limit}
 
 @api_router.get("/products/featured")
 async def get_featured_products():
@@ -656,13 +436,13 @@ async def get_featured_products():
         {"is_active": True, "discount_price": {"$ne": None}},
         {"_id": 0}
     ).limit(8).to_list(8)
-    return products
+    return convert_objectid(products)
 
 @api_router.get("/products/all")
-async def get_all_products(user: User = Depends(get_admin_user)):
-    """Get all products (admin)"""
+async def get_all_products():
+    """Get all products"""
     products = await db.products.find({}, {"_id": 0}).to_list(1000)
-    return products
+    return convert_objectid(products)
 
 @api_router.get("/products/{product_id}")
 async def get_product(product_id: str):
@@ -670,11 +450,11 @@ async def get_product(product_id: str):
     product = await db.products.find_one({"product_id": product_id}, {"_id": 0})
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
-    return product
+    return convert_objectid(product)
 
 @api_router.post("/upload/image")
-async def upload_image(file: UploadFile = File(...), user: User = Depends(get_admin_user)):
-    """Upload product image (admin only)"""
+async def upload_image(file: UploadFile = File(...)):
+    """Upload product image"""
     logger.info(f"Upload image endpoint called - File: {file.filename}, Type: {file.content_type}")
     
     try:
@@ -704,7 +484,7 @@ async def upload_image(file: UploadFile = File(...), user: User = Depends(get_ad
         
         # Return the URL to access the image
         image_url = f"/uploads/{unique_filename}"
-        logger.info(f"Image uploaded successfully: {unique_filename} by user {user.user_id}")
+        logger.info(f"Image uploaded successfully: {unique_filename}")
         
         return {
             "url": image_url,
@@ -719,8 +499,8 @@ async def upload_image(file: UploadFile = File(...), user: User = Depends(get_ad
         raise HTTPException(status_code=500, detail=f"Failed to upload image: {str(e)}")
 
 @api_router.post("/products")
-async def create_product(data: ProductCreate, user: User = Depends(get_admin_user)):
-    """Create new product (admin)"""
+async def create_product(data: ProductCreate):
+    """Create new product"""
     product_data = data.model_dump()
     variations = []
     for v in product_data.get("variations", []):
@@ -738,8 +518,8 @@ async def create_product(data: ProductCreate, user: User = Depends(get_admin_use
     return created_product
 
 @api_router.put("/products/{product_id}")
-async def update_product(product_id: str, data: ProductUpdate, user: User = Depends(get_admin_user)):
-    """Update product (admin)"""
+async def update_product(product_id: str, data: ProductUpdate):
+    """Update product"""
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
     if "variations" in update_data:
         variations = []
@@ -760,8 +540,8 @@ async def update_product(product_id: str, data: ProductUpdate, user: User = Depe
     return product
 
 @api_router.delete("/products/{product_id}")
-async def delete_product(product_id: str, user: User = Depends(get_admin_user)):
-    """Delete product (admin)"""
+async def delete_product(product_id: str):
+    """Delete product"""
     result = await db.products.delete_one({"product_id": product_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -770,11 +550,16 @@ async def delete_product(product_id: str, user: User = Depends(get_admin_user)):
 # ==================== CART ENDPOINTS ====================
 
 @api_router.get("/cart")
-async def get_cart(user: User = Depends(get_current_user)):
+async def get_cart(request: Request):
     """Get user cart with product details"""
-    cart = await db.carts.find_one({"user_id": user.user_id}, {"_id": 0})
+    user = await get_current_user(request)
+    
+    # Use user_id from auth or create a temporary one
+    user_id = user.user_id if user else f"anon_{uuid.uuid4().hex[:16]}"
+    
+    cart = await db.carts.find_one({"user_id": user_id}, {"_id": 0})
     if not cart:
-        cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user.user_id, "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
+        cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user_id, "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
         await db.carts.insert_one(cart)
     
     # Enrich with product details
@@ -795,14 +580,17 @@ async def get_cart(user: User = Depends(get_current_user)):
             })
     
     cart["items"] = enriched_items
-    return cart
+    return convert_objectid(cart)
 
 @api_router.post("/cart/add")
-async def add_to_cart(item: CartItem, user: User = Depends(get_current_user)):
+async def add_to_cart(item: CartItem, request: Request):
     """Add item to cart"""
-    cart = await db.carts.find_one({"user_id": user.user_id}, {"_id": 0})
+    user = await get_current_user(request)
+    user_id = user.user_id if user else f"anon_{uuid.uuid4().hex[:16]}"
+    
+    cart = await db.carts.find_one({"user_id": user_id}, {"_id": 0})
     if not cart:
-        cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user.user_id, "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
+        cart = {"cart_id": f"cart_{uuid.uuid4().hex[:12]}", "user_id": user_id, "items": [], "updated_at": datetime.now(timezone.utc).isoformat()}
         await db.carts.insert_one(cart)
     
     items = cart.get("items", [])
@@ -817,15 +605,17 @@ async def add_to_cart(item: CartItem, user: User = Depends(get_current_user)):
         items.append(item.model_dump())
     
     await db.carts.update_one(
-        {"user_id": user.user_id},
+        {"user_id": user_id},
         {"$set": {"items": items, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
     return {"message": "Item added to cart"}
 
 @api_router.put("/cart/update")
-async def update_cart_item(item: CartItem, user: User = Depends(get_current_user)):
+async def update_cart_item(item: CartItem, request: Request):
     """Update cart item quantity"""
-    cart = await db.carts.find_one({"user_id": user.user_id}, {"_id": 0})
+    user = await get_current_user(request)
+    user_id = user.user_id if user else f"anon_{uuid.uuid4().hex[:16]}"
+    cart = await db.carts.find_one({"user_id": user_id}, {"_id": 0})
     if not cart:
         raise HTTPException(status_code=404, detail="Cart not found")
     
@@ -839,31 +629,41 @@ async def update_cart_item(item: CartItem, user: User = Depends(get_current_user
             break
     
     await db.carts.update_one(
-        {"user_id": user.user_id},
+        {"user_id": user_id},
         {"$set": {"items": items, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
     return {"message": "Cart updated"}
 
 @api_router.delete("/cart/remove/{product_id}")
-async def remove_from_cart(product_id: str, variation_id: Optional[str] = None, user: User = Depends(get_current_user)):
+async def remove_from_cart(product_id: str, variation_id: Optional[str] = None, request: Request = None):
     """Remove item from cart"""
-    cart = await db.carts.find_one({"user_id": user.user_id}, {"_id": 0})
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    cart = await db.carts.find_one({"user_id": user_id}, {"_id": 0})
     if not cart:
         raise HTTPException(status_code=404, detail="Cart not found")
     
     items = [i for i in cart.get("items", []) if not (i["product_id"] == product_id and i.get("variation_id") == variation_id)]
     
     await db.carts.update_one(
-        {"user_id": user.user_id},
+        {"user_id": user_id},
         {"$set": {"items": items, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
     return {"message": "Item removed from cart"}
 
 @api_router.delete("/cart/clear")
-async def clear_cart(user: User = Depends(get_current_user)):
+async def clear_cart(request: Request = None):
     """Clear cart"""
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
     await db.carts.update_one(
-        {"user_id": user.user_id},
+        {"user_id": user_id},
         {"$set": {"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
     return {"message": "Cart cleared"}
@@ -871,9 +671,15 @@ async def clear_cart(user: User = Depends(get_current_user)):
 # ==================== FAVORITES ENDPOINTS ====================
 
 @api_router.get("/favorites")
-async def get_favorites(user: User = Depends(get_current_user)):
+async def get_favorites(request: Request = None):
     """Get user favorites with product details"""
-    favorites = await db.favorites.find({"user_id": user.user_id}, {"_id": 0}).to_list(100)
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    
+    favorites = await db.favorites.find({"user_id": user_id}, {"_id": 0}).to_list(100)
     enriched = []
     for fav in favorites:
         product = await db.products.find_one({"product_id": fav["product_id"]}, {"_id": 0})
@@ -882,22 +688,34 @@ async def get_favorites(user: User = Depends(get_current_user)):
     return enriched
 
 @api_router.post("/favorites/{product_id}")
-async def add_favorite(product_id: str, user: User = Depends(get_current_user)):
+async def add_favorite(product_id: str, request: Request = None):
     """Add product to favorites"""
-    existing = await db.favorites.find_one({"user_id": user.user_id, "product_id": product_id})
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    
+    existing = await db.favorites.find_one({"user_id": user_id, "product_id": product_id})
     if existing:
         return {"message": "Already in favorites"}
     
-    fav = Favorite(user_id=user.user_id, product_id=product_id)
+    fav = Favorite(user_id=user_id, product_id=product_id)
     doc = fav.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
     await db.favorites.insert_one(doc)
     return {"message": "Added to favorites"}
 
 @api_router.delete("/favorites/{product_id}")
-async def remove_favorite(product_id: str, user: User = Depends(get_current_user)):
+async def remove_favorite(product_id: str, request: Request = None):
     """Remove product from favorites"""
-    result = await db.favorites.delete_one({"user_id": user.user_id, "product_id": product_id})
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    
+    result = await db.favorites.delete_one({"user_id": user_id, "product_id": product_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Not in favorites")
     return {"message": "Removed from favorites"}
@@ -911,16 +729,24 @@ async def get_product_reviews(product_id: str):
     return reviews
 
 @api_router.post("/reviews")
-async def create_review(data: ReviewCreate, user: User = Depends(get_current_user)):
+async def create_review(data: ReviewCreate, request: Request = None):
     """Create a review"""
-    existing = await db.reviews.find_one({"product_id": data.product_id, "user_id": user.user_id})
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    user_name = "Anonymous"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+        user_name = user.name if user else "Anonymous"
+    
+    existing = await db.reviews.find_one({"product_id": data.product_id, "user_id": user_id})
     if existing:
         raise HTTPException(status_code=400, detail="You already reviewed this product")
     
     review = Review(
         product_id=data.product_id,
-        user_id=user.user_id,
-        user_name=user.name,
+        user_id=user_id,
+        user_name=user_name,
         rating=data.rating,
         comment=data.comment
     )
@@ -932,9 +758,15 @@ async def create_review(data: ReviewCreate, user: User = Depends(get_current_use
     return created_review
 
 @api_router.delete("/reviews/{review_id}")
-async def delete_review(review_id: str, user: User = Depends(get_current_user)):
+async def delete_review(review_id: str, request: Request = None):
     """Delete own review"""
-    result = await db.reviews.delete_one({"review_id": review_id, "user_id": user.user_id})
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    
+    result = await db.reviews.delete_one({"review_id": review_id, "user_id": user_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Review not found or not yours")
     return {"message": "Review deleted"}
@@ -942,9 +774,15 @@ async def delete_review(review_id: str, user: User = Depends(get_current_user)):
 # ==================== ORDERS ENDPOINTS ====================
 
 @api_router.post("/orders")
-async def create_order(data: OrderCreate, user: User = Depends(get_current_user)):
+async def create_order(data: OrderCreate, request: Request = None):
     """Create order from cart"""
-    cart = await db.carts.find_one({"user_id": user.user_id}, {"_id": 0})
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    
+    cart = await db.carts.find_one({"user_id": user_id}, {"_id": 0})
     if not cart or not cart.get("items"):
         raise HTTPException(status_code=400, detail="Cart is empty")
     
@@ -1038,9 +876,9 @@ async def create_order(data: OrderCreate, user: User = Depends(get_current_user)
     total = subtotal - discount
     
     order = Order(
-        user_id=user.user_id,
-        user_name=user.name,
-        user_email=user.email,
+        user_id=user_id,
+        user_name=user.name if user else "Customer",
+        user_email=user.email if user else "guest@example.com",
         phone=data.phone,
         address=data.address,
         city=data.city,
@@ -1070,7 +908,7 @@ async def create_order(data: OrderCreate, user: User = Depends(get_current_user)
     
     # Clear cart
     await db.carts.update_one(
-        {"user_id": user.user_id},
+        {"user_id": user_id},
         {"$set": {"items": [], "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
     
@@ -1079,19 +917,24 @@ async def create_order(data: OrderCreate, user: User = Depends(get_current_user)
     return created_order
 
 @api_router.get("/orders")
-async def get_user_orders(user: User = Depends(get_current_user)):
+async def get_user_orders(request: Request = None):
     """Get user orders"""
-    orders = await db.orders.find({"user_id": user.user_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
-    return orders
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    
+    orders = await db.orders.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return convert_objectid(orders)
 
 @api_router.get("/orders/all")
 async def get_all_orders(
     status: Optional[str] = None,
     page: int = 1,
-    limit: int = 20,
-    user: User = Depends(get_admin_user)
+    limit: int = 20
 ):
-    """Get all orders (admin)"""
+    """Get all orders"""
     query = {}
     if status:
         query["status"] = status
@@ -1100,11 +943,11 @@ async def get_all_orders(
     orders = await db.orders.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
     total = await db.orders.count_documents(query)
     
-    return {"orders": orders, "total": total, "page": page, "pages": (total + limit - 1) // limit}
+    return {"orders": convert_objectid(orders), "total": total, "page": page, "pages": (total + limit - 1) // limit}
 
 @api_router.put("/orders/{order_id}/status")
-async def update_order_status(order_id: str, status: str, user: User = Depends(get_admin_user)):
-    """Update order status (admin)"""
+async def update_order_status(order_id: str, status: str, request: Request = None):
+    """Update order status"""
     # Get current order to check previous status
     order = await db.orders.find_one({"order_id": order_id}, {"_id": 0})
     if not order:
@@ -1161,17 +1004,17 @@ async def get_active_promotions():
         "start_date": {"$lte": now.isoformat()},
         "end_date": {"$gte": now.isoformat()}
     }, {"_id": 0}).to_list(100)
-    return promotions
+    return convert_objectid(promotions)
 
 @api_router.get("/promotions/all")
-async def get_all_promotions(user: User = Depends(get_admin_user)):
-    """Get all promotions (admin)"""
+async def get_all_promotions():
+    """Get all promotions"""
     promotions = await db.promotions.find({}, {"_id": 0}).to_list(100)
-    return promotions
+    return convert_objectid(promotions)
 
 @api_router.post("/promotions")
-async def create_promotion(data: PromotionCreate, user: User = Depends(get_admin_user)):
-    """Create promotion (admin)"""
+async def create_promotion(data: PromotionCreate):
+    """Create promotion"""
     promo = Promotion(**data.model_dump())
     doc = promo.model_dump()
     doc["code"] = doc["code"].upper()
@@ -1184,8 +1027,8 @@ async def create_promotion(data: PromotionCreate, user: User = Depends(get_admin
     return created_promo
 
 @api_router.put("/promotions/{promotion_id}")
-async def update_promotion(promotion_id: str, data: Dict[str, Any], user: User = Depends(get_admin_user)):
-    """Update promotion (admin)"""
+async def update_promotion(promotion_id: str, data: Dict[str, Any]):
+    """Update promotion"""
     if "code" in data:
         data["code"] = data["code"].upper()
     if "start_date" in data and isinstance(data["start_date"], datetime):
@@ -1203,8 +1046,8 @@ async def update_promotion(promotion_id: str, data: Dict[str, Any], user: User =
     return promo
 
 @api_router.delete("/promotions/{promotion_id}")
-async def delete_promotion(promotion_id: str, user: User = Depends(get_admin_user)):
-    """Delete promotion (admin)"""
+async def delete_promotion(promotion_id: str):
+    """Delete promotion"""
     result = await db.promotions.delete_one({"promotion_id": promotion_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Promotion not found")
@@ -1248,10 +1091,9 @@ async def validate_promotion(code: str, subtotal: float):
 async def get_users(
     page: int = 1,
     limit: int = 20,
-    search: Optional[str] = None,
-    user: User = Depends(get_admin_user)
+    search: Optional[str] = None
 ):
-    """Get all users (admin)"""
+    """Get all users"""
     query = {}
     if search:
         query["$or"] = [
@@ -1266,8 +1108,8 @@ async def get_users(
     return {"users": users, "total": total, "page": page, "pages": (total + limit - 1) // limit}
 
 @api_router.put("/users/{user_id}/role")
-async def update_user_role(user_id: str, role: str, admin: User = Depends(get_admin_user)):
-    """Update user role (admin)"""
+async def update_user_role(user_id: str, role: str):
+    """Update user role"""
     if role not in ["customer", "admin"]:
         raise HTTPException(status_code=400, detail="Invalid role")
     
@@ -1280,21 +1122,27 @@ async def update_user_role(user_id: str, role: str, admin: User = Depends(get_ad
     return {"message": "Role updated"}
 
 @api_router.put("/profile")
-async def update_profile(data: UserUpdate, user: User = Depends(get_current_user)):
+async def update_profile(data: UserUpdate, request: Request = None):
     """Update user profile"""
+    user = None
+    user_id = f"anon_{uuid.uuid4().hex[:16]}"
+    if request:
+        user = await get_current_user(request)
+        user_id = user.user_id if user else user_id
+    
     update_data = {k: v for k, v in data.model_dump().items() if v is not None}
     await db.users.update_one(
-        {"user_id": user.user_id},
+        {"user_id": user_id},
         {"$set": update_data}
     )
-    updated_user = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    updated_user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     return updated_user
 
 # ==================== DASHBOARD STATS (ADMIN) ====================
 
 @api_router.get("/dashboard/stats")
-async def get_dashboard_stats(user: User = Depends(get_admin_user)):
-    """Get dashboard statistics (admin)"""
+async def get_dashboard_stats():
+    """Get dashboard statistics"""
     # Total products
     total_products = await db.products.count_documents({"is_active": True})
     
@@ -1349,7 +1197,7 @@ async def get_dashboard_stats(user: User = Depends(get_admin_user)):
         
         # Calculate cost of goods for this order
         for item in order.get("items", []):
-            product = await db.products.find_one({"product_id": item.get("product_id")})
+            product = await db.products.find_one({"product_id": item.get("product_id")}, {"_id": 0})
             if product:
                 cost_price = product.get("cost_price", 0)
                 quantity = item.get("quantity", 0)
@@ -1385,7 +1233,7 @@ async def get_dashboard_stats(user: User = Depends(get_admin_user)):
         
         # Calculate cost for this order
         for item in order.get("items", []):
-            product = await db.products.find_one({"product_id": item.get("product_id")})
+            product = await db.products.find_one({"product_id": item.get("product_id")}, {"_id": 0})
             if product:
                 cost_price = product.get("cost_price", 0)
                 quantity = item.get("quantity", 0)
@@ -1441,19 +1289,11 @@ app.include_router(api_router)
 # Mount static files directory for uploaded images
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
-# CORS Configuration
-cors_origins = [
-    "http://localhost:3000",
-    "http://localhost:8000",
-    "http://23.20.97.217",
-    "http://23.20.97.217:8000",
-]
-
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
     allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )
