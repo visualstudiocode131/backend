@@ -1331,11 +1331,19 @@ app.include_router(api_router)
 # Mount static files directory for uploaded images
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
+# CORS Configuration
+cors_origins = [
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://23.20.97.217",
+    "http://23.20.97.217:8000",
+]
+
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
     allow_methods=["*"],
     allow_headers=["*"],
 )
