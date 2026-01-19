@@ -42,6 +42,15 @@ class CustomJSONEncoder(JSONEncoder):
 app = FastAPI(title="Laushop API")
 app.json_encoder = CustomJSONEncoder
 
+# Add CORS Middleware early
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
@@ -97,6 +106,7 @@ class Product(BaseModel):
     discount_price: Optional[float] = None
     cost_price: float = 0  # Precio de costo para calcular margen de ganancia
     category_id: str
+    supplier_id: Optional[str] = None  # ID del proveedor
     images: List[str] = []
     variations: List[ProductVariation] = []
     stock: int = 0
@@ -111,6 +121,7 @@ class ProductCreate(BaseModel):
     discount_price: Optional[float] = None
     cost_price: float = 0  # Precio de costo
     category_id: str
+    supplier_id: Optional[str] = None  # ID del proveedor
     images: List[str] = []
     variations: List[Dict[str, Any]] = []
     stock: int = 0
@@ -122,6 +133,7 @@ class ProductUpdate(BaseModel):
     discount_price: Optional[float] = None
     cost_price: Optional[float] = None  # Precio de costo
     category_id: Optional[str] = None
+    supplier_id: Optional[str] = None  # ID del proveedor
     images: Optional[List[str]] = None
     variations: Optional[List[Dict[str, Any]]] = None
     stock: Optional[int] = None
@@ -455,17 +467,24 @@ async def get_product(product_id: str):
 @api_router.post("/upload/image")
 async def upload_image(file: UploadFile = File(...)):
     """Upload product image"""
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    
     logger.info(f"Upload image endpoint called - File: {file.filename}, Type: {file.content_type}")
     
     try:
+        # Read file content first
+        file_content = await file.read()
+        if not file_content:
+            raise HTTPException(status_code=400, detail="File is empty")
+        
         # Validate file type
         allowed_types = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
         if file.content_type not in allowed_types:
             logger.warning(f"Invalid file type: {file.content_type}")
-            raise HTTPException(status_code=400, detail="Invalid file type. Allowed: JPEG, PNG, WebP, GIF")
+            raise HTTPException(status_code=400, detail=f"Invalid file type: {file.content_type}. Allowed: JPEG, PNG, WebP, GIF")
         
         # Validate file size (max 5MB)
-        file_content = await file.read()
         file_size = len(file_content)
         logger.info(f"File size: {file_size} bytes")
         
@@ -1110,7 +1129,7 @@ async def get_users(
 @api_router.put("/users/{user_id}/role")
 async def update_user_role(user_id: str, role: str):
     """Update user role"""
-    if role not in ["customer", "admin"]:
+    if role not in ["customer", "admin", "supplier"]:
         raise HTTPException(status_code=400, detail="Invalid role")
     
     result = await db.users.update_one(
@@ -1138,9 +1157,157 @@ async def update_profile(data: UserUpdate, request: Request = None):
     updated_user = await db.users.find_one({"user_id": user_id}, {"_id": 0})
     return updated_user
 
-# ==================== DASHBOARD STATS (ADMIN) ====================
+# ==================== SUPPLIER ENDPOINTS ====================
 
-@api_router.get("/dashboard/stats")
+@api_router.post("/supplier/products")
+async def supplier_create_product(data: ProductCreate, request: Request = None):
+    """Create product as supplier"""
+    user = await get_current_user(request)
+    if not user or user.role != "supplier":
+        raise HTTPException(status_code=403, detail="Only suppliers can create products")
+    
+    # Get product data and remove supplier_id if present (we'll use the authenticated user's ID)
+    product_data = data.model_dump()
+    product_data.pop('supplier_id', None)  # Remove if it exists
+    
+    # Create product with supplier_id from authenticated user
+    product = Product(
+        **product_data,
+        supplier_id=user.user_id,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc)
+    )
+    
+    doc = product.model_dump()
+    result = await db.products.insert_one(doc)
+    
+    created_product = await db.products.find_one({"product_id": product.product_id}, {"_id": 0})
+    return created_product
+
+@api_router.get("/supplier/products")
+async def supplier_get_products(request: Request = None):
+    """Get supplier's products"""
+    user = await get_current_user(request)
+    if not user or user.role != "supplier":
+        raise HTTPException(status_code=403, detail="Only suppliers can view their products")
+    
+    products = await db.products.find({"supplier_id": user.user_id}, {"_id": 0}).to_list(None)
+    return products
+
+@api_router.put("/supplier/products/{product_id}")
+async def supplier_update_product(product_id: str, data: ProductUpdate, request: Request = None):
+    """Update supplier's product"""
+    user = await get_current_user(request)
+    if not user or user.role != "supplier":
+        raise HTTPException(status_code=403, detail="Only suppliers can update products")
+    
+    # Check if product belongs to supplier
+    product = await db.products.find_one({"product_id": product_id}, {"_id": 0})
+    if not product or product.get("supplier_id") != user.user_id:
+        raise HTTPException(status_code=403, detail="Product not found or doesn't belong to you")
+    
+    update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    update_data["updated_at"] = datetime.now(timezone.utc)
+    
+    await db.products.update_one(
+        {"product_id": product_id},
+        {"$set": update_data}
+    )
+    
+    updated_product = await db.products.find_one({"product_id": product_id}, {"_id": 0})
+    return updated_product
+
+@api_router.get("/supplier/invoices")
+async def supplier_get_invoices(request: Request = None):
+    """Get invoices for supplier's products (orders containing supplier's products)"""
+    user = await get_current_user(request)
+    if not user or user.role != "supplier":
+        raise HTTPException(status_code=403, detail="Only suppliers can view invoices")
+    
+    # Get supplier's products
+    supplier_products = await db.products.find(
+        {"supplier_id": user.user_id}, 
+        {"product_id": 1}
+    ).to_list(None)
+    supplier_product_ids = [p["product_id"] for p in supplier_products]
+    
+    # Find orders that contain supplier's products
+    invoices = []
+    all_orders = await db.orders.find({}, {"_id": 0}).to_list(None)
+    
+    for order in all_orders:
+        supplier_items = [item for item in order.get("items", []) 
+                         if item.get("product_id") in supplier_product_ids]
+        
+        if supplier_items:
+            # Calculate subtotal for supplier's items
+            supplier_subtotal = sum(item.get("total_price", 0) for item in supplier_items)
+            
+            # Create invoice object
+            invoice = {
+                "order_id": order.get("order_id"),
+                "user_id": order.get("user_id"),
+                "user_name": order.get("user_name"),
+                "user_email": order.get("user_email"),
+                "items": supplier_items,
+                "supplier_subtotal": supplier_subtotal,
+                "order_total": order.get("total"),
+                "status": order.get("status"),
+                "created_at": order.get("created_at"),
+                "phone": order.get("phone"),
+                "address": order.get("address"),
+                "city": order.get("city")
+            }
+            invoices.append(invoice)
+    
+    # Sort by created_at descending
+    invoices.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return invoices
+
+@api_router.put("/supplier/invoices/{order_id}/status")
+async def supplier_update_order_status(order_id: str, status: str, request: Request = None):
+    """Update order status if it contains supplier's products"""
+    user = await get_current_user(request)
+    if not user or user.role != "supplier":
+        raise HTTPException(status_code=403, detail="Only suppliers can update invoice status")
+    
+    # Valid status values
+    valid_statuses = ["pending", "completed", "shipped", "cancelled"]
+    if status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Valid values: {', '.join(valid_statuses)}")
+    
+    # Get the order
+    order = await db.orders.find_one({"order_id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Check if this order contains any of the supplier's products
+    supplier_products = await db.products.find(
+        {"supplier_id": user.user_id}, 
+        {"product_id": 1}
+    ).to_list(None)
+    supplier_product_ids = [p["product_id"] for p in supplier_products]
+    
+    # Verify order contains supplier's products
+    has_supplier_products = any(
+        item.get("product_id") in supplier_product_ids 
+        for item in order.get("items", [])
+    )
+    
+    if not has_supplier_products:
+        raise HTTPException(status_code=403, detail="This order does not contain your products")
+    
+    # Update order status
+    await db.orders.update_one(
+        {"order_id": order_id},
+        {"$set": {"status": status}}
+    )
+    
+    # Return updated order
+    updated_order = await db.orders.find_one({"order_id": order_id}, {"_id": 0})
+    return updated_order
+
+
 async def get_dashboard_stats():
     """Get dashboard statistics"""
     # Total products
@@ -1288,15 +1455,6 @@ app.include_router(api_router)
 
 # Mount static files directory for uploaded images
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
-
-# CORS Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
